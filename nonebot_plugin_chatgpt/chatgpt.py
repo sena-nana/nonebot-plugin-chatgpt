@@ -1,7 +1,6 @@
 import uuid
 from typing import Any, Dict, Optional
 from contextlib import asynccontextmanager
-import asyncio
 from nonebot import get_driver
 from nonebot.log import logger
 from nonebot.utils import escape_tag, run_sync
@@ -36,7 +35,10 @@ class Chatbot:
         self.proxies = proxies
         self.timeout = timeout
         self.content = None
-        self.authorization = None
+        self.parent_id = None
+        self.conversation_id = None
+        self.browser = None
+        self.is_first_run = True
         self.playwright = async_playwright()
         if self.session_token:
             self.auto_auth = False
@@ -46,7 +48,7 @@ class Chatbot:
             raise ValueError("至少需要配置 session_token 或者 account 和 password")
 
     async def playwright_start(self):
-        #启动浏览器，在插件开始运行时调用
+        """启动浏览器，在插件开始运行时调用"""
         playwright = await self.playwright.start()
         try:
             self.browser = await playwright.firefox.launch(
@@ -61,7 +63,7 @@ class Chatbot:
         await self.set_cookie(self.session_token)
 
     async def set_cookie(self, session_token):
-        #设置session_token
+        """设置session_token"""
         await self.content.add_cookies(
             [
                 {
@@ -75,7 +77,7 @@ class Chatbot:
 
     @driver.on_shutdown
     async def playwright_close(self):
-        #关闭浏览器
+        """关闭浏览器"""
         await self.content.close()
         await self.browser.close()
         await self.playwright.__aexit__()
@@ -90,10 +92,6 @@ class Chatbot:
     @property
     def id(self) -> str:
         return str(uuid.uuid4())
-
-    @property
-    def headers(self) -> Dict[str, str]:
-        return {"Authorization": f"Bearer {self.authorization}"}
 
     def get_payload(self, prompt: str) -> Dict[str, Any]:
         return {
@@ -112,7 +110,7 @@ class Chatbot:
 
     @asynccontextmanager
     async def get_page(self):
-        #打开网页，这是一个异步上下文管理器，使用async with调用
+        """打开网页，这是一个异步上下文管理器，使用async with调用"""
         page = await self.content.new_page()
         js = "Object.defineProperties(navigator, {webdriver:{get:()=>undefined}});"
         await page.add_init_script(js)
@@ -121,9 +119,8 @@ class Chatbot:
         await page.close()
 
     async def get_chat_response(self, prompt: str) -> str:
-        if not self.authorization:
-            await self.refresh_session()
         async with self.get_page() as page:
+            logger.debug("正在发送请求")
             if self.proxies:
                 await self.get_cf_cookies(page)
 
@@ -135,11 +132,27 @@ class Chatbot:
             await self.content.route(
                 "https://chat.openai.com/backend-api/conversation", change_json
             )
-            await page.locator("textarea").fill(prompt)
+            if self.is_first_run:
+                await page.wait_for_selector(
+                    ".btn.flex.justify-center.gap-2.btn-neutral.ml-auto"
+                )
+                await page.click(".btn.flex.justify-center.gap-2.btn-neutral.ml-auto")
+                await page.click(".btn.flex.justify-center.gap-2.btn-neutral.ml-auto")
+                await page.click(".btn.flex.justify-center.gap-2.btn-primary.ml-auto")
+                self.is_first_run = False
+            await page.wait_for_selector("textarea")
             async with page.expect_response(
-                "https://chat.openai.com/backend-api/conversation"
+                "https://chat.openai.com/backend-api/conversation",
+                timeout=self.timeout * 1000,
             ) as response_info:
-                await page.locator("button").last.click()
+                textarea = page.locator("textarea")
+                botton = page.locator("button").last
+                for _ in range(3):
+                    if await textarea.is_enabled():
+                        await textarea.fill(prompt)
+                    await page.wait_for_timeout(500)
+                    if await botton.is_enabled():
+                        await botton.click()
             response = await response_info.value
             if response.status == 429:
                 return "请求过多，请放慢速度"
@@ -159,6 +172,7 @@ class Chatbot:
             response = json.loads(data)
             self.parent_id = response["message"]["id"]
             self.conversation_id = response["conversation_id"]
+            logger.debug("发送请求结束")
         return response["message"]["content"]["parts"][0]
 
     async def refresh_session(self) -> None:
@@ -173,7 +187,7 @@ class Chatbot:
                 async with page.expect_request(
                     "https://chat.openai.com/api/auth/session"
                 ) as session:
-                    await asyncio.sleep(1)
+                    page.goto("https://chat.openai.com/chat")
                 request = await session.value
                 response = await request.response()
             if response.status != 200:
@@ -195,7 +209,6 @@ class Chatbot:
             raise e
         if not auth.access_token:
             logger.error("ChatGPT 登陆错误!")
-        self.authorization = auth.access_token
         if auth.session_token:
             self.session_token = auth.session_token
         elif possible_tokens := auth.session.cookies.get(SESSION_TOKEN_KEY):
@@ -219,15 +232,10 @@ class Chatbot:
             label = page.locator("label span")
             if await label.count():
                 await label.click()
-            await asyncio.sleep(1)
+            await page.wait_for_timeout(1000)
             textarea = page.locator("textarea")
             if await textarea.count():
                 break
         else:
             logger.error("cf cookies获取失败")
-        next_button = page.locator(".btn.flex.justify-center.gap-2.btn-neutral.ml-auto")
-        if await next_button.count():
-            await next_button.click()
-            await page.click(".btn.flex.justify-center.gap-2.btn-neutral.ml-auto")
-            await page.click(".btn.flex.justify-center.gap-2.btn-primary.ml-auto")
         logger.debug("cf cookies获取成功")
